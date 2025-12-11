@@ -91,10 +91,13 @@ class CDPBrowserManager:
             # 1. 检测浏览器路径
             browser_path = await self._get_browser_path()
 
-            # 2. 获取可用端口
+            # 2. 清理可能存在的旧浏览器进程（解决端口冲突问题）
+            await self._cleanup_stale_browser_processes(config.CDP_DEBUG_PORT)
+
+            # 3. 获取可用端口
             self.debug_port = self.launcher.find_available_port(config.CDP_DEBUG_PORT)
 
-            # 3. 启动浏览器
+            # 4. 启动浏览器
             await self._launch_browser(browser_path, headless)
 
             # 4. 注册清理处理器（确保异常退出时也能清理）
@@ -145,6 +148,91 @@ class CDPBrowserManager:
         utils.logger.info(f"[CDPBrowserManager] 浏览器路径: {browser_path}")
 
         return browser_path
+
+    async def _cleanup_stale_browser_processes(self, port: int):
+        """
+        清理可能占用端口的旧浏览器进程
+        解决端口被占用但CDP无法响应（HTTP 503）的问题
+        """
+        import subprocess
+        import platform
+        
+        try:
+            # 检查端口是否被占用
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                result = s.connect_ex(('localhost', port))
+                if result != 0:
+                    # 端口未被占用，无需清理
+                    return
+            
+            utils.logger.info(f"[CDPBrowserManager] 检测到端口 {port} 被占用，尝试验证CDP连接...")
+            
+            # 尝试获取CDP信息，判断是否是正常的浏览器
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"http://localhost:{port}/json/version", timeout=3
+                    )
+                    if response.status_code == 200:
+                        utils.logger.info(f"[CDPBrowserManager] 端口 {port} 上的浏览器CDP正常响应")
+                        # CDP正常，需要终止这个进程以便重新启动
+                        await self._kill_process_on_port(port)
+                        return
+            except Exception:
+                pass
+            
+            utils.logger.warning(f"[CDPBrowserManager] 端口 {port} 被占用但CDP无响应，尝试终止占用进程...")
+            await self._kill_process_on_port(port)
+            
+        except Exception as e:
+            utils.logger.warning(f"[CDPBrowserManager] 清理旧进程时出错: {e}")
+    
+    async def _kill_process_on_port(self, port: int):
+        """
+        终止占用指定端口的进程
+        """
+        import subprocess
+        import platform
+        
+        try:
+            system = platform.system()
+            
+            if system == "Darwin" or system == "Linux":
+                # macOS / Linux: 使用 lsof 找到占用端口的进程
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}"],
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip():
+                    pids = result.stdout.strip().split('\n')
+                    for pid in pids:
+                        if pid:
+                            utils.logger.info(f"[CDPBrowserManager] 终止占用端口 {port} 的进程: PID {pid}")
+                            subprocess.run(["kill", "-9", pid], capture_output=True)
+                    await asyncio.sleep(1)  # 等待进程终止
+                    utils.logger.info(f"[CDPBrowserManager] 已清理端口 {port} 上的旧进程")
+                    
+            elif system == "Windows":
+                # Windows: 使用 netstat 找到占用端口的进程
+                result = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True,
+                    text=True
+                )
+                for line in result.stdout.split('\n'):
+                    if f":{port}" in line and "LISTENING" in line:
+                        parts = line.split()
+                        if parts:
+                            pid = parts[-1]
+                            utils.logger.info(f"[CDPBrowserManager] 终止占用端口 {port} 的进程: PID {pid}")
+                            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                await asyncio.sleep(1)
+                utils.logger.info(f"[CDPBrowserManager] 已清理端口 {port} 上的旧进程")
+                            
+        except Exception as e:
+            utils.logger.warning(f"[CDPBrowserManager] 终止进程时出错: {e}")
 
     async def _test_cdp_connection(self, debug_port: int) -> bool:
         """
@@ -198,39 +286,57 @@ class CDPBrowserManager:
         ):
             raise RuntimeError(f"浏览器在 {config.BROWSER_LAUNCH_TIMEOUT} 秒内未能启动")
 
-        # 额外等待一秒让CDP服务完全启动
-        await asyncio.sleep(1)
+        # 额外等待让CDP服务完全启动（增加到3秒）
+        await asyncio.sleep(3)
 
-        # 测试CDP连接
-        if not await self._test_cdp_connection(self.debug_port):
+        # 测试CDP连接，重试多次
+        max_retries = 5
+        for i in range(max_retries):
+            if await self._test_cdp_connection(self.debug_port):
+                utils.logger.info(f"[CDPBrowserManager] CDP连接测试成功 (第{i+1}次尝试)")
+                break
+            if i < max_retries - 1:
+                utils.logger.info(f"[CDPBrowserManager] CDP连接测试失败，等待重试 ({i+1}/{max_retries})...")
+                await asyncio.sleep(2)
+        else:
             utils.logger.warning(
-                "[CDPBrowserManager] CDP连接测试失败，但将继续尝试连接"
+                "[CDPBrowserManager] CDP连接测试多次失败，但将继续尝试连接"
             )
 
     async def _get_browser_websocket_url(self, debug_port: int) -> str:
         """
-        获取浏览器的WebSocket连接URL
+        获取浏览器的WebSocket连接URL（带重试机制）
         """
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"http://localhost:{debug_port}/json/version", timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    ws_url = data.get("webSocketDebuggerUrl")
-                    if ws_url:
-                        utils.logger.info(
-                            f"[CDPBrowserManager] 获取到浏览器WebSocket URL: {ws_url}"
-                        )
-                        return ws_url
+        max_retries = 5
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"http://localhost:{debug_port}/json/version", timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        ws_url = data.get("webSocketDebuggerUrl")
+                        if ws_url:
+                            utils.logger.info(
+                                f"[CDPBrowserManager] 获取到浏览器WebSocket URL: {ws_url}"
+                            )
+                            return ws_url
+                        else:
+                            raise RuntimeError("未找到webSocketDebuggerUrl")
                     else:
-                        raise RuntimeError("未找到webSocketDebuggerUrl")
+                        raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    utils.logger.warning(f"[CDPBrowserManager] 获取WebSocket URL失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                    await asyncio.sleep(2)  # 等待后重试
                 else:
-                    raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] 获取WebSocket URL失败: {e}")
-            raise
+                    utils.logger.error(f"[CDPBrowserManager] 获取WebSocket URL失败: {e}")
+        
+        raise last_exception
 
     async def _connect_via_cdp(self, playwright: Playwright):
         """
