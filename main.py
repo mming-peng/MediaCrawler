@@ -62,6 +62,7 @@ class CrawlerFactory:
 
 
 crawler: Optional[AbstractCrawler] = None
+_stop_requested = False
 
 
 # persist-1<persist1@126.com>
@@ -115,11 +116,15 @@ async def async_cleanup():
         # 检查并清理CDP浏览器
         if hasattr(crawler, 'cdp_manager') and crawler.cdp_manager:
             try:
-                await crawler.cdp_manager.cleanup(force=True)  # 强制清理浏览器进程
+                # 清理可能遇到 Playwright 卡顿，增加总体超时兜底
+                await asyncio.wait_for(
+                    crawler.cdp_manager.cleanup(force=True),
+                    timeout=10,
+                )
             except Exception as e:
-                # 只在非预期错误时打印
+                # 只在非预期错误且有实际错误消息时打印
                 error_msg = str(e).lower()
-                if "closed" not in error_msg and "disconnected" not in error_msg:
+                if error_msg and "closed" not in error_msg and "disconnected" not in error_msg:
                     print(f"[Main] 清理CDP浏览器时出错: {e}")
 
         # 检查并清理标准浏览器上下文（仅在非CDP模式下）
@@ -151,19 +156,40 @@ def cleanup():
 
 
 def signal_handler(signum, _frame):
-    """信号处理器，处理Ctrl+C等中断信号"""
-    print(f"\n[Main] 收到中断信号 {signum}，正在清理资源...")
-    cleanup()
-    sys.exit(0)
+    """信号处理器：优雅停止事件循环，交给 finally 清理"""
+    global _stop_requested
+    if _stop_requested:
+        # 二次 Ctrl+C 直接抛出，避免长时间阻塞
+        raise KeyboardInterrupt
+
+    _stop_requested = True
+    print(f"\n[Main] 收到中断信号 {signum}，正在尝试优雅退出...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        pass
+
+    # 触发外层 try/except，确保立即进入 finally 清理
+    raise KeyboardInterrupt
 
 if __name__ == "__main__":
-    # 注册信号处理器
+    # 注册信号处理器（不要在处理器里直接 cleanup）
     signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
 
     try:
-        asyncio.get_event_loop().run_until_complete(main())
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\n[Main] 收到键盘中断，正在清理资源...")
+    except RuntimeError as e:
+        # loop 被 signal_handler stop 后 run_until_complete 会抛这个错误，视为正常退出
+        if _stop_requested and "Event loop stopped before Future completed" in str(e):
+            print("\n[Main] 收到中断信号，正在清理资源...")
+        else:
+            raise
     finally:
         cleanup()

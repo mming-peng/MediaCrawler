@@ -21,6 +21,7 @@
 import os
 import asyncio
 import socket
+import time
 import httpx
 import signal
 import atexit
@@ -60,22 +61,41 @@ class CDPBrowserManager:
         # 注册atexit清理
         atexit.register(sync_cleanup)
 
-        # 注册信号处理器
+        # 注册信号处理器（仅在上层未注册时）
+        prev_sigint_handler = signal.getsignal(signal.SIGINT)
+        prev_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
         def signal_handler(signum, frame):
-            """信号处理器"""
+            """信号处理器（兜底）"""
             utils.logger.info(f"[CDPBrowserManager] 收到信号 {signum}，清理浏览器进程")
             if self.launcher and self.launcher.browser_process:
                 self.launcher.cleanup()
-            # 重新引发KeyboardInterrupt以便正常退出流程
+            # 上层没有信号处理器时，这里负责中断进程
             if signum == signal.SIGINT:
                 raise KeyboardInterrupt
+            raise SystemExit(0)
 
-        # 注册SIGINT (Ctrl+C) 和 SIGTERM
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        # 如果检测到 main.py 或其他上层已安装 SIGINT/SIGTERM 处理器，则不要覆盖，避免退出异常/卡住
+        need_install_sigint = prev_sigint_handler in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+            signal.default_int_handler,
+        )
+        need_install_sigterm = prev_sigterm_handler in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+        )
+
+        if need_install_sigint:
+            signal.signal(signal.SIGINT, signal_handler)
+        if need_install_sigterm:
+            signal.signal(signal.SIGTERM, signal_handler)
 
         self._cleanup_registered = True
-        utils.logger.info("[CDPBrowserManager] 清理处理器已注册")
+        if need_install_sigint or need_install_sigterm:
+            utils.logger.info("[CDPBrowserManager] 清理处理器已注册")
+        else:
+            utils.logger.info("[CDPBrowserManager] 检测到上层已注册信号处理器，跳过CDP信号注册")
 
     async def launch_and_connect(
         self,
@@ -170,7 +190,8 @@ class CDPBrowserManager:
             
             # 尝试获取CDP信息，判断是否是正常的浏览器
             try:
-                async with httpx.AsyncClient() as client:
+                # 访问本地CDP端口时禁用环境代理，避免被系统代理拖慢/卡住
+                async with httpx.AsyncClient(trust_env=False) as client:
                     response = await client.get(
                         f"http://localhost:{port}/json/version", timeout=3
                     )
@@ -285,58 +306,63 @@ class CDPBrowserManager:
             self.debug_port, config.BROWSER_LAUNCH_TIMEOUT
         ):
             raise RuntimeError(f"浏览器在 {config.BROWSER_LAUNCH_TIMEOUT} 秒内未能启动")
-
-        # 额外等待让CDP服务完全启动（增加到3秒）
-        await asyncio.sleep(3)
-
-        # 测试CDP连接，重试多次
-        max_retries = 5
-        for i in range(max_retries):
-            if await self._test_cdp_connection(self.debug_port):
-                utils.logger.info(f"[CDPBrowserManager] CDP连接测试成功 (第{i+1}次尝试)")
-                break
-            if i < max_retries - 1:
-                utils.logger.info(f"[CDPBrowserManager] CDP连接测试失败，等待重试 ({i+1}/{max_retries})...")
-                await asyncio.sleep(2)
-        else:
-            utils.logger.warning(
-                "[CDPBrowserManager] CDP连接测试多次失败，但将继续尝试连接"
-            )
+        # 端口就绪后直接进入CDP握手，具体可用性由后续获取WebSocket URL重试负责
 
     async def _get_browser_websocket_url(self, debug_port: int) -> str:
         """
         获取浏览器的WebSocket连接URL（带重试机制）
         """
-        max_retries = 5
-        last_exception = None
-        
-        for attempt in range(max_retries):
+        # 旧实现单次超时较长（10s）且固定重试次数，遇到系统代理/端口半就绪时
+        # 容易让浏览器长时间停留在默认页。这里改为：
+        # - 禁用环境代理（trust_env=False），保证访问127.0.0.1直连
+        # - 使用更短的单次超时 + 总体超时（沿用 BROWSER_LAUNCH_TIMEOUT）
+        overall_timeout = max(5, int(getattr(config, "BROWSER_LAUNCH_TIMEOUT", 30)))
+        deadline = time.monotonic() + overall_timeout
+        attempt = 0
+        last_exception: Optional[Exception] = None
+
+        # 短超时快速轮询，直到拿到 WebSocket URL 或达到总体超时
+        while time.monotonic() < deadline:
+            attempt += 1
             try:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(trust_env=False) as client:
                     response = await client.get(
-                        f"http://localhost:{debug_port}/json/version", timeout=10
+                        f"http://127.0.0.1:{debug_port}/json/version",
+                        timeout=2,
                     )
-                    if response.status_code == 200:
-                        data = response.json()
-                        ws_url = data.get("webSocketDebuggerUrl")
-                        if ws_url:
-                            utils.logger.info(
-                                f"[CDPBrowserManager] 获取到浏览器WebSocket URL: {ws_url}"
-                            )
-                            return ws_url
-                        else:
-                            raise RuntimeError("未找到webSocketDebuggerUrl")
-                    else:
-                        raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {response.text}"
+                    )
+
+                data = response.json()
+                ws_url = data.get("webSocketDebuggerUrl")
+                if ws_url:
+                    utils.logger.info(
+                        f"[CDPBrowserManager] 获取到浏览器WebSocket URL: {ws_url}"
+                    )
+                    return ws_url
+                raise RuntimeError("未找到webSocketDebuggerUrl")
+
             except Exception as e:
                 last_exception = e
-                if attempt < max_retries - 1:
-                    utils.logger.warning(f"[CDPBrowserManager] 获取WebSocket URL失败 (尝试 {attempt+1}/{max_retries}): {e}")
-                    await asyncio.sleep(2)  # 等待后重试
+                # 前几次用warning提示，后续降级为debug避免刷屏
+                if attempt <= 3:
+                    utils.logger.warning(
+                        f"[CDPBrowserManager] 获取WebSocket URL失败 (尝试 {attempt}): {e}"
+                    )
                 else:
-                    utils.logger.error(f"[CDPBrowserManager] 获取WebSocket URL失败: {e}")
-        
-        raise last_exception
+                    utils.logger.debug(
+                        f"[CDPBrowserManager] 获取WebSocket URL失败 (尝试 {attempt}): {e}"
+                    )
+                await asyncio.sleep(0.5)
+
+        utils.logger.error(
+            f"[CDPBrowserManager] 获取WebSocket URL超时（{overall_timeout}s）"
+        )
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("获取WebSocket URL失败")
 
     async def _connect_via_cdp(self, playwright: Playwright):
         """
@@ -455,7 +481,8 @@ class CDPBrowserManager:
                     try:
                         pages = self.browser_context.pages
                         if pages is not None:
-                            await self.browser_context.close()
+                            # Playwright 在连接异常时 close 可能卡住，增加超时保护
+                            await asyncio.wait_for(self.browser_context.close(), timeout=5)
                             utils.logger.info("[CDPBrowserManager] 浏览器上下文已关闭")
                     except:
                         utils.logger.debug("[CDPBrowserManager] 浏览器上下文已经被关闭")
@@ -476,7 +503,8 @@ class CDPBrowserManager:
                 try:
                     # 检查浏览器是否仍然连接
                     if self.browser.is_connected():
-                        await self.browser.close()
+                        # 同样增加超时，避免退出时阻塞
+                        await asyncio.wait_for(self.browser.close(), timeout=5)
                         utils.logger.info("[CDPBrowserManager] 浏览器连接已断开")
                     else:
                         utils.logger.debug("[CDPBrowserManager] 浏览器连接已经断开")
